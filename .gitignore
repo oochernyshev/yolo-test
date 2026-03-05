@@ -1,0 +1,9 @@
+# Local model weights and exported model binaries
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.tflite
+*.pb

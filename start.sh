@@ -13,4 +13,25 @@ fi
 
 source .venv/bin/activate
 
-exec python -m streamlit run app.py "$@"
+# Run Streamlit as a managed background job and forward a gentle TERM
+# on Ctrl+C to avoid noisy shutdown traces.
+set +e
+set -m
+python -m streamlit run app-video.py "$@" &
+STREAMLIT_PID=$!
+
+shutdown() {
+  if kill -0 "$STREAMLIT_PID" 2>/dev/null; then
+    echo "Stopping Streamlit..."
+    kill -TERM "$STREAMLIT_PID" 2>/dev/null || true
+    wait "$STREAMLIT_PID" 2>/dev/null || true
+  fi
+  exit 0
+}
+
+trap shutdown INT TERM
+
+wait "$STREAMLIT_PID"
+EXIT_CODE=$?
+trap - INT TERM
+exit "$EXIT_CODE"

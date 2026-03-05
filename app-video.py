@@ -28,7 +28,7 @@ with st.sidebar:
         st.markdown("### Detection")
         conf = st.slider("Confidence", 0.05, 0.90, 0.15, 0.05)
         iou = st.slider("IoU", 0.30, 0.90, 0.70, 0.05)
-        imgsz = st.selectbox("imgsz", [640, 768, 960, 1280], index=0)
+        imgsz = st.selectbox("imgsz", [640, 768, 960, 1280], index=3)
 
     else:
         st.markdown("## Pose model")
@@ -84,14 +84,14 @@ if uploaded is not None and st.session_state.video_path is None:
 # --- Controls ---
 c1, c2, c3 = st.columns(3)
 with c1:
-    if st.button("▶ Play", use_container_width=True):
+    if st.button("▶ Play", width="stretch"):
         st.session_state.playing = True
         st.session_state.paused = False
 with c2:
-    if st.button("⏸ Pause", use_container_width=True):
+    if st.button("⏸ Pause", width="stretch"):
         st.session_state.paused = not st.session_state.paused
 with c3:
-    if st.button("⏹ Stop", use_container_width=True):
+    if st.button("⏹ Stop", width="stretch"):
         st.session_state.playing = False
         st.session_state.paused = False
 
@@ -99,7 +99,7 @@ frame_box = st.empty()
 
 # Keep last frame visible across Streamlit reruns (e.g., when pressing Pause)
 if st.session_state.last_frame_rgb is not None:
-    frame_box.image(st.session_state.last_frame_rgb, channels="RGB", use_container_width=True)
+    frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
 
 # Stats row
 s1, s2, s3, s4, s5 = st.columns(5)
@@ -134,7 +134,7 @@ if frame_count > 0:
         step=1,
         key="seek_slider",
     )
-    if st.sidebar.button("⏩ Seek", use_container_width=True):
+    if st.sidebar.button("⏩ Seek", width="stretch"):
         st.session_state.seek_to = int(seek_val)
 else:
     st.sidebar.info("Seek disabled (unknown frame count).")
@@ -162,7 +162,7 @@ def draw_people(frame_bgr):
     n_people = len(results[0].boxes) if results and results[0].boxes is not None else 0
     annotated_bgr = results[0].plot() if results else frame_bgr
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    frame_box.image(annotated_rgb, channels="RGB", use_container_width=True)
+    frame_box.image(annotated_rgb, channels="RGB", width="stretch")
     st.session_state.last_frame_rgb = annotated_rgb
     st.session_state.last_people = n_people
     return n_people
@@ -189,7 +189,7 @@ def draw_pose(frame_bgr):
 
     annotated_bgr = results[0].plot() if results else frame_bgr
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    frame_box.image(annotated_rgb, channels="RGB", use_container_width=True)
+    frame_box.image(annotated_rgb, channels="RGB", width="stretch")
     st.session_state.last_frame_rgb = annotated_rgb
     st.session_state.last_people = n_people
     return n_people
@@ -231,7 +231,7 @@ while True:
     if st.session_state.paused:
         # Keep the last rendered frame visible while paused (even after reruns)
         if st.session_state.last_frame_rgb is not None:
-            frame_box.image(st.session_state.last_frame_rgb, channels="RGB", use_container_width=True)
+            frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
         status.warning("Paused. You can Seek, then press Pause again or Play to resume.")
         time.sleep(0.1)
         continue
