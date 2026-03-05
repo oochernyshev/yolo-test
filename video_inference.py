@@ -20,6 +20,13 @@ def _safe_int(value, default=0):
         return default
 
 
+def _safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def _overlay_detected_frames(image_bgr, boxes, alpha: float = 0.22):
     if boxes is None or not hasattr(boxes, "xyxy") or boxes.xyxy is None:
         return image_bgr
@@ -59,6 +66,56 @@ def _overlay_detected_frames(image_bgr, boxes, alpha: float = 0.22):
     return blended
 
 
+def _collect_detections(result, include_keypoints: bool = False):
+    if result is None or result.boxes is None or not hasattr(result.boxes, "xyxy"):
+        return []
+
+    boxes = result.boxes
+    names = result.names if hasattr(result, "names") else {}
+    keypoints_obj = result.keypoints if include_keypoints and hasattr(result, "keypoints") else None
+    keypoints_xy = keypoints_obj.xy if keypoints_obj is not None and hasattr(keypoints_obj, "xy") else None
+
+    detections = []
+    n = len(boxes.xyxy)
+    for i in range(n):
+        try:
+            x1, y1, x2, y2 = [int(v) for v in boxes.xyxy[i].tolist()]
+        except Exception:
+            continue
+
+        det = {
+            "bbox_xyxy": [x1, y1, x2, y2],
+        }
+
+        if hasattr(boxes, "conf") and boxes.conf is not None and i < len(boxes.conf):
+            conf_val = _safe_float(boxes.conf[i].item())
+            if conf_val is not None:
+                det["confidence"] = conf_val
+
+        class_id = None
+        if hasattr(boxes, "cls") and boxes.cls is not None and i < len(boxes.cls):
+            class_id = _safe_int(boxes.cls[i].item(), default=None)
+            if class_id is not None:
+                det["class_id"] = class_id
+                if isinstance(names, dict) and class_id in names:
+                    det["class_name"] = str(names[class_id])
+
+        if hasattr(boxes, "id") and boxes.id is not None and i < len(boxes.id):
+            track_id = _safe_int(boxes.id[i].item(), default=None)
+            if track_id is not None:
+                det["track_id"] = track_id
+
+        if keypoints_xy is not None and i < len(keypoints_xy):
+            try:
+                det["keypoints_xy"] = [[float(px), float(py)] for px, py in keypoints_xy[i].tolist()]
+            except Exception:
+                pass
+
+        detections.append(det)
+
+    return detections
+
+
 @st.cache_resource
 def load_model(name: str):
     return YOLO(name)
@@ -86,6 +143,7 @@ def draw_people(
         verbose=False,
     )
     n_people = len(results[0].boxes) if results and results[0].boxes is not None else 0
+    detections = _collect_detections(results[0], include_keypoints=False) if results else []
     annotated_bgr = results[0].plot() if results else frame_bgr
     if results and results[0].boxes is not None:
         annotated_bgr = _overlay_detected_frames(annotated_bgr, results[0].boxes)
@@ -93,6 +151,7 @@ def draw_people(
     frame_box.image(annotated_rgb, channels="RGB", width="stretch")
     state["last_frame_rgb"] = annotated_rgb
     state["last_people"] = n_people
+    state["last_detections"] = detections
     return n_people
 
 
@@ -122,6 +181,8 @@ def draw_pose(
         except Exception:
             n_people = 0
 
+    detections = _collect_detections(results[0], include_keypoints=True) if results else []
+
     annotated_bgr = results[0].plot() if results else frame_bgr
     if results and results[0].boxes is not None:
         annotated_bgr = _overlay_detected_frames(annotated_bgr, results[0].boxes)
@@ -129,4 +190,5 @@ def draw_pose(
     frame_box.image(annotated_rgb, channels="RGB", width="stretch")
     state["last_frame_rgb"] = annotated_rgb
     state["last_people"] = n_people
+    state["last_detections"] = detections
     return n_people

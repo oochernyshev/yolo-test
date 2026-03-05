@@ -1,8 +1,48 @@
+import json
+import os
 import time
+from datetime import datetime, timezone
 
 import cv2
 
 from video_state import SOURCE_DIRECT, SOURCE_RTSP
+
+
+def _write_detection_json(
+    state,
+    mode: str,
+    source_mode: str,
+    source_uri: str,
+    frame_pos: int,
+    active_model_name: str,
+    detections,
+):
+    session_dir = state.get("export_json_session_dir")
+    if not session_dir:
+        return "JSON export directory is not set."
+
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "frame": int(frame_pos),
+            "mode": mode,
+            "model": active_model_name,
+            "source_mode": source_mode,
+            "source_uri": source_uri,
+            "detections_count": len(detections),
+            "detections": detections,
+        }
+        file_name = f"frame_{int(frame_pos):08d}.json"
+        out_path = os.path.join(session_dir, file_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        state["export_json_written"] = int(state.get("export_json_written", 0)) + 1
+        state["export_json_last_error"] = None
+    except Exception as exc:
+        return str(exc)
+
+    return None
 
 
 def run_playback(
@@ -143,6 +183,21 @@ def run_playback(
                 status.error(f"Inference error: {exc}")
                 state.playing = False
                 break
+
+            detections = state.get("last_detections") or []
+            if state.get("export_json_enabled") and detections:
+                export_err = _write_detection_json(
+                    state=state,
+                    mode=mode,
+                    source_mode=source_mode,
+                    source_uri=source_uri,
+                    frame_pos=int(state.frame_pos),
+                    active_model_name=active_model_name,
+                    detections=detections,
+                )
+                if export_err and export_err != state.get("export_json_last_error"):
+                    state["export_json_last_error"] = export_err
+                    status.warning(f"JSON export error: {export_err}")
 
             proc = time.time() - t0
             state.last_proc = proc

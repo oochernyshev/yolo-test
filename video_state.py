@@ -32,6 +32,12 @@ def init_state(state):
         "rtsp_server_container_name": None,
         "rtsp_server_log_path": None,
         "source_mode_prev": SOURCE_RTSP,
+        "last_detections": [],
+        "export_json_enabled": True,
+        "export_json_dir": "detections_json",
+        "export_json_session_dir": None,
+        "export_json_written": 0,
+        "export_json_last_error": None,
     }
     for key, value in defaults.items():
         if key not in state:

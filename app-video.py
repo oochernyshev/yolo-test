@@ -1,5 +1,7 @@
+import os
 import tempfile
 import time
+from datetime import datetime
 
 import streamlit as st
 
@@ -64,8 +66,39 @@ with st.sidebar:
     max_skip = st.selectbox("Max skip", [1, 2, 3, 4, 6, 8, 12], index=3)
     base_stride = st.selectbox("Base stride", [1, 2, 3, 4], index=0)
 
+    st.markdown("## Export")
+    export_json_enabled = st.toggle(
+        "Save JSON per frame (only frames with detections)",
+        value=bool(st.session_state.export_json_enabled),
+    )
+    export_json_dir_val = st.text_input(
+        "JSON output folder",
+        value=str(st.session_state.export_json_dir),
+        disabled=not export_json_enabled,
+    )
+
     st.markdown("### Seek")
     st.caption("Tip: Pause -> Seek -> Start processing. Seek is only available in Direct file mode.")
+
+st.session_state.export_json_enabled = bool(export_json_enabled)
+if str(export_json_dir_val).strip():
+    st.session_state.export_json_dir = str(export_json_dir_val).strip()
+
+
+def _prepare_json_export_run(state, mode_value):
+    if not state["export_json_enabled"]:
+        state["export_json_session_dir"] = None
+        state["export_json_written"] = 0
+        state["export_json_last_error"] = None
+        return
+
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_tag = "rtsp" if mode_value == SOURCE_RTSP else "direct"
+    session_dir = os.path.join(str(state["export_json_dir"]), f"{mode_tag}_{run_stamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    state["export_json_session_dir"] = session_dir
+    state["export_json_written"] = 0
+    state["export_json_last_error"] = None
 
 if st.session_state.source_mode_prev != source_mode:
     if st.session_state.source_mode_prev == SOURCE_RTSP:
@@ -182,12 +215,22 @@ if st.session_state.last_frame_rgb is not None:
 if source_mode == SOURCE_RTSP and st.session_state.rtsp_last_error:
     st.error(st.session_state.rtsp_last_error)
 
+if st.session_state.export_json_enabled:
+    if st.session_state.export_json_session_dir:
+        st.caption(
+            f"JSON export: {st.session_state.export_json_written} files -> "
+            f"{st.session_state.export_json_session_dir}"
+        )
+    if st.session_state.export_json_last_error:
+        st.warning(f"JSON export error: {st.session_state.export_json_last_error}")
+
 can_start_processing = st.session_state.video_path is not None
 
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("▶ Start processing", width="stretch", disabled=not can_start_processing):
         st.session_state.rtsp_last_error = None
+        _prepare_json_export_run(st.session_state, source_mode)
         if source_mode == SOURCE_RTSP and not st.session_state.rtsp_streaming:
             st.session_state.rtsp_should_be_running = True
             err = start_rtsp_stream(st.session_state, st.session_state.video_path, st.session_state.rtsp_url)
