@@ -1,21 +1,44 @@
-import time
 import tempfile
-import cv2
+import time
+
 import streamlit as st
-from ultralytics import YOLO
 
-# Smooth Streamlit player (no per-frame st.rerun)
-# - People tracking: YOLO26 (n/s/m)
-# - Optional pose tracking (pretrained pose models)
-# - Play / Pause / Stop
-# - Adaptive real-time skipping when inference is slow
+from video_inference import draw_people, draw_pose, load_model
+from video_playback import run_playback
+from video_rtsp import (
+    grab_rtsp_preview_frame,
+    get_video_info,
+    start_rtsp_stream,
+    stop_rtsp_stream,
+    sync_rtsp_process_state,
+)
+from video_state import SOURCE_DIRECT, SOURCE_RTSP, init_state
 
-st.set_page_config(page_title="Video Analytics • YOLO26 + Pose", page_icon="🎥", layout="wide")
+st.set_page_config(page_title="Video Analytics - YOLO26 + Pose", page_icon="🎥", layout="wide")
 st.title("🎥 Video Analytics: People Tracking + Pose")
+
+init_state(st.session_state)
 
 with st.sidebar:
     st.markdown("## Video")
     uploaded = st.file_uploader("Upload video", type=["mp4", "mov", "mkv", "avi"])
+
+    st.markdown("## Source")
+    source_mode = st.selectbox("Input source", [SOURCE_DIRECT, SOURCE_RTSP], index=1)
+    rtsp_perf_mode = False
+
+    start_rtsp_clicked = False
+    stop_rtsp_clicked = False
+    if source_mode == SOURCE_RTSP:
+        rtsp_url_val = st.text_input("RTSP URL", value=st.session_state.rtsp_url)
+        st.session_state.rtsp_url = rtsp_url_val.strip() or st.session_state.rtsp_url
+        st.caption("This uses ffmpeg to simulate a camera as an RTSP source.")
+        rtsp_perf_mode = st.toggle("RTSP performance mode", value=True)
+        col_stream_1, col_stream_2 = st.columns(2)
+        with col_stream_1:
+            start_rtsp_clicked = st.button("Start stream", width="stretch")
+        with col_stream_2:
+            stop_rtsp_clicked = st.button("Stop stream", width="stretch")
 
     st.markdown("## Mode")
     mode = st.selectbox("Analytics", ["People tracking (YOLO26)", "Pose tracking"], index=0)
@@ -29,10 +52,8 @@ with st.sidebar:
         conf = st.slider("Confidence", 0.05, 0.90, 0.15, 0.05)
         iou = st.slider("IoU", 0.30, 0.90, 0.70, 0.05)
         imgsz = st.selectbox("imgsz", [640, 768, 960, 1280], index=3)
-
     else:
         st.markdown("## Pose model")
-        # Pretrained pose models ship with Ultralytics (no training needed)
         pose_model_name = st.selectbox("Model", ["yolov8n-pose.pt", "yolov8s-pose.pt", "yolov8m-pose.pt"], index=0)
         pose_conf = st.slider("Pose confidence", 0.05, 0.90, 0.25, 0.05)
         pose_imgsz = st.selectbox("Pose imgsz", [640, 768, 960, 1280], index=0)
@@ -44,64 +65,152 @@ with st.sidebar:
     base_stride = st.selectbox("Base stride", [1, 2, 3, 4], index=0)
 
     st.markdown("### Seek")
-    st.caption("Tip: Pause → Seek → Play. Seeking while playing also works (it will jump).")
+    st.caption("Tip: Pause -> Seek -> Start processing. Seek is only available in Direct file mode.")
 
-# --- State ---
-if "video_path" not in st.session_state:
-    st.session_state.video_path = None
-if "playing" not in st.session_state:
+if st.session_state.source_mode_prev != source_mode:
+    if st.session_state.source_mode_prev == SOURCE_RTSP:
+        stop_rtsp_stream(st.session_state)
+    st.session_state.source_mode_prev = source_mode
     st.session_state.playing = False
-if "paused" not in st.session_state:
     st.session_state.paused = False
-if "frame_pos" not in st.session_state:
     st.session_state.frame_pos = 0
-if "last_proc" not in st.session_state:
-    st.session_state.last_proc = 0.0
-if "seek_to" not in st.session_state:
-    st.session_state.seek_to = None
-if "last_frame_rgb" not in st.session_state:
-    st.session_state.last_frame_rgb = None
-if "last_people" not in st.session_state:
-    st.session_state.last_people = 0
+    st.session_state.rtsp_last_error = None
+    st.session_state.rtsp_should_be_running = False
 
-@st.cache_resource
-def load_model(name: str):
-    return YOLO(name)
+sync_rtsp_process_state(st.session_state)
 
-# Lazy-load depending on mode
+if uploaded is not None:
+    uploaded_signature = (uploaded.name, uploaded.size)
+    if st.session_state.uploaded_signature != uploaded_signature:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(uploaded.read())
+        tfile.flush()
+        st.session_state.video_path = tfile.name
+        st.session_state.uploaded_signature = uploaded_signature
+        st.session_state.frame_pos = 0
+        st.session_state.last_frame_rgb = None
+        st.session_state.playing = False
+        st.session_state.paused = False
+        st.session_state.rtsp_last_error = None
+        st.session_state.rtsp_should_be_running = False
+        if st.session_state.rtsp_streaming:
+            stop_rtsp_stream(st.session_state)
+
+if start_rtsp_clicked:
+    if st.session_state.video_path is None:
+        st.sidebar.error("Upload a video first.")
+    else:
+        st.session_state.rtsp_last_error = None
+        st.session_state.rtsp_should_be_running = True
+        err = start_rtsp_stream(st.session_state, st.session_state.video_path, st.session_state.rtsp_url)
+        if err is not None:
+            st.session_state.rtsp_last_error = err
+            st.session_state.rtsp_next_retry_ts = time.time() + 2.0
+            st.sidebar.error(err)
+        else:
+            st.session_state.rtsp_next_retry_ts = 0.0
+            st.sidebar.success("RTSP stream started.")
+
+if stop_rtsp_clicked:
+    stop_rtsp_stream(st.session_state)
+    st.session_state.rtsp_last_error = None
+    st.session_state.rtsp_should_be_running = False
+    st.session_state.rtsp_next_retry_ts = 0.0
+    st.sidebar.info("RTSP stream stopped.")
+
+# Keep RTSP stream alive in RTSP mode: restart publisher if it exits unexpectedly.
+if (
+    source_mode == SOURCE_RTSP
+    and st.session_state.rtsp_should_be_running
+    and st.session_state.video_path is not None
+    and not st.session_state.rtsp_streaming
+    and time.time() >= float(st.session_state.rtsp_next_retry_ts or 0.0)
+):
+    err = start_rtsp_stream(st.session_state, st.session_state.video_path, st.session_state.rtsp_url)
+    if err is not None:
+        st.session_state.rtsp_last_error = err
+        st.session_state.rtsp_next_retry_ts = time.time() + 2.0
+    else:
+        st.session_state.rtsp_next_retry_ts = 0.0
+
 if mode == "People tracking (YOLO26)":
     model = load_model(people_model_name)
+
+    def draw_frame(frame_bgr):
+        eff_imgsz = min(int(imgsz), 640) if source_mode == SOURCE_RTSP and rtsp_perf_mode else int(imgsz)
+        return draw_people(model, frame_bgr, frame_box, conf, iou, eff_imgsz, tracker, st.session_state)
+
+    active_model_name = people_model_name
 else:
     model = load_model(pose_model_name)
 
-# --- Save upload to temp file once ---
-if uploaded is not None and st.session_state.video_path is None:
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tfile.write(uploaded.read())
-    st.session_state.video_path = tfile.name
-    st.session_state.frame_pos = 0
+    def draw_frame(frame_bgr):
+        eff_pose_imgsz = (
+            min(int(pose_imgsz), 640) if source_mode == SOURCE_RTSP and rtsp_perf_mode else int(pose_imgsz)
+        )
+        return draw_pose(model, frame_bgr, frame_box, pose_conf, eff_pose_imgsz, pose_tracker, st.session_state)
 
-# --- Controls ---
-c1, c2, c3 = st.columns(3)
-with c1:
-    if st.button("▶ Play", width="stretch"):
-        st.session_state.playing = True
-        st.session_state.paused = False
-with c2:
-    if st.button("⏸ Pause", width="stretch"):
-        st.session_state.paused = not st.session_state.paused
-with c3:
-    if st.button("⏹ Stop", width="stretch"):
-        st.session_state.playing = False
-        st.session_state.paused = False
+    active_model_name = pose_model_name
 
-frame_box = st.empty()
+if source_mode == SOURCE_RTSP:
+    pcol, rcol = st.columns([1, 3])
+    with pcol:
+        st.markdown("#### RTSP Stream (preview)")
+        m1, m2 = st.columns(2)
+        rtsp_fps_metric = m1.empty()
+        rtsp_frame_metric = m2.empty()
+        use_browser_preview = bool(st.session_state.rtsp_hls_url)
+        if use_browser_preview:
+            st.caption("Browser-native HLS preview")
+            st.video(st.session_state.rtsp_hls_url)
+            rtsp_preview_box = None
+        else:
+            rtsp_preview_box = st.empty()
+    with rcol:
+        st.markdown("#### Processing result")
+        frame_box = st.empty()
+else:
+    use_browser_preview = False
+    rtsp_fps_metric = None
+    rtsp_frame_metric = None
+    rtsp_preview_box = None
+    frame_box = st.empty()
 
-# Keep last frame visible across Streamlit reruns (e.g., when pressing Pause)
 if st.session_state.last_frame_rgb is not None:
     frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
 
-# Stats row
+if source_mode == SOURCE_RTSP and st.session_state.rtsp_last_error:
+    st.error(st.session_state.rtsp_last_error)
+
+can_start_processing = st.session_state.video_path is not None
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("▶ Start processing", width="stretch", disabled=not can_start_processing):
+        st.session_state.rtsp_last_error = None
+        if source_mode == SOURCE_RTSP and not st.session_state.rtsp_streaming:
+            st.session_state.rtsp_should_be_running = True
+            err = start_rtsp_stream(st.session_state, st.session_state.video_path, st.session_state.rtsp_url)
+            if err is not None:
+                st.session_state.rtsp_last_error = err
+                st.session_state.rtsp_next_retry_ts = time.time() + 2.0
+                st.session_state.playing = False
+                st.session_state.paused = False
+            else:
+                st.session_state.rtsp_next_retry_ts = 0.0
+                st.session_state.playing = True
+                st.session_state.paused = False
+        else:
+            st.session_state.playing = True
+            st.session_state.paused = False
+with c2:
+    if st.button("⏸ Pause", width="stretch", disabled=not st.session_state.playing):
+        st.session_state.paused = not st.session_state.paused
+with c3:
+    if st.button("⏹ Stop", width="stretch", disabled=not st.session_state.playing):
+        st.session_state.playing = False
+        st.session_state.paused = False
+
 s1, s2, s3, s4, s5 = st.columns(5)
 stat_fps = s1.metric("App FPS", "-")
 stat_subjects = s2.metric("People", "-")
@@ -112,185 +221,108 @@ stat_model = s5.metric("Model", "-")
 status = st.empty()
 
 if st.session_state.video_path is None:
-    st.info("Upload a video to begin.")
+    status.info("Upload a video to begin.")
     st.stop()
 
-cap = cv2.VideoCapture(st.session_state.video_path)
-if not cap.isOpened():
-    st.error("Could not open the video. Try MP4 (H.264).")
-    st.stop()
+if source_mode == SOURCE_RTSP and not st.session_state.rtsp_streaming:
+    status.info("Start RTSP stream first, then press Start processing.")
 
-# Video info
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+fps = 30.0
+frame_count = 0
+if source_mode == SOURCE_DIRECT:
+    fps_info, frame_count_info = get_video_info(st.session_state.video_path)
+    if fps_info is None:
+        st.error("Could not open the video. Try MP4 (H.264).")
+        st.stop()
+    fps = fps_info
+    frame_count = frame_count_info
 
-# Seek UI (needs frame_count)
-if frame_count > 0:
-    seek_val = st.sidebar.slider(
-        "Position (frame)",
-        min_value=0,
-        max_value=max(0, frame_count - 1),
-        value=int(min(st.session_state.frame_pos, frame_count - 1)),
-        step=1,
-        key="seek_slider",
-    )
-    if st.sidebar.button("⏩ Seek", width="stretch"):
-        st.session_state.seek_to = int(seek_val)
-else:
-    st.sidebar.info("Seek disabled (unknown frame count).")
-
-# Resume from last position
-cap.set(cv2.CAP_PROP_POS_FRAMES, int(st.session_state.frame_pos))
-
-# Target wall-clock duration for a rendered step at base_stride (1x)
-target_dt = (float(base_stride) / float(fps)) if fps > 0 else (1.0 / 30.0)
-
-
-def draw_people(frame_bgr):
-    # Track people only (COCO class 0)
-    results = model.track(
-        frame_bgr,
-        classes=[0],
-        conf=float(conf),
-        iou=float(iou),
-        imgsz=int(imgsz),
-        persist=True,
-        tracker=tracker,
-        device="mps",
-        verbose=False,
-    )
-    n_people = len(results[0].boxes) if results and results[0].boxes is not None else 0
-    annotated_bgr = results[0].plot() if results else frame_bgr
-    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    frame_box.image(annotated_rgb, channels="RGB", width="stretch")
-    st.session_state.last_frame_rgb = annotated_rgb
-    st.session_state.last_people = n_people
-    return n_people
-
-
-def draw_pose(frame_bgr):
-    # Pose tracking (keypoints)
-    results = model.track(
-        frame_bgr,
-        conf=float(pose_conf),
-        imgsz=int(pose_imgsz),
-        persist=True,
-        tracker=pose_tracker,
-        device="mps",
-        verbose=False,
-    )
-
-    n_people = 0
-    if results and hasattr(results[0], "keypoints") and results[0].keypoints is not None:
-        try:
-            n_people = len(results[0].keypoints)
-        except Exception:
-            n_people = 0
-
-    annotated_bgr = results[0].plot() if results else frame_bgr
-    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    frame_box.image(annotated_rgb, channels="RGB", width="stretch")
-    st.session_state.last_frame_rgb = annotated_rgb
-    st.session_state.last_people = n_people
-    return n_people
-
-
-# --- Playback loop ---
-# Updates ONLY the frame placeholder, avoiding full-page blinking.
-try:
-    while True:
-        if not st.session_state.playing:
-            status.info("Stopped. Press Play.")
-            break
-
-        # Handle seek requests (works in stopped/paused/playing)
-        if st.session_state.seek_to is not None and frame_count > 0:
-            new_pos = int(max(0, min(st.session_state.seek_to, frame_count - 1)))
-            st.session_state.seek_to = None
-            st.session_state.frame_pos = new_pos
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(st.session_state.frame_pos))
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                try:
-                    if mode == "People tracking (YOLO26)":
-                        _ = draw_people(frame)
-                        active_model = people_model_name
-                    else:
-                        _ = draw_pose(frame)
-                        active_model = pose_model_name
-                    stat_mode.metric("Mode", mode)
-                    stat_model.metric("Model", active_model)
-                    stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
-                except Exception as e:
-                    status.error(f"Seek inference error: {e}")
-                    break
-                status.info(f"Seeked to frame {st.session_state.frame_pos}.")
-            else:
-                status.error("Seek failed (could not read frame).")
-                break
-
-        if st.session_state.paused:
-            # Keep the last rendered frame visible while paused (even after reruns)
-            if st.session_state.last_frame_rgb is not None:
-                frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
-            status.warning("Paused. You can Seek, then press Pause again or Play to resume.")
-            time.sleep(0.1)
-            continue
-
-        # Decide how many frames to advance this tick
-        eff_stride = int(base_stride)
-        if adaptive:
-            last_proc = float(st.session_state.last_proc or 0.0)
-            ratio = last_proc / max(1e-6, target_dt) if last_proc > 0 else 1.0
-            eff_stride = max(int(base_stride), min(int(max_skip), int(round(ratio))))
-            eff_stride = max(1, eff_stride)
-
-        frame = None
-        for _ in range(int(eff_stride)):
-            ok, f = cap.read()
-            if not ok:
-                st.session_state.playing = False
-                frame = None
-                break
-            frame = f
-            st.session_state.frame_pos += 1
-
-        if frame is None:
-            status.success("Finished.")
-            break
-
-        t0 = time.time()
-
-        try:
-            if mode == "People tracking (YOLO26)":
-                n = draw_people(frame)
-                active_model = people_model_name
-            else:
-                n = draw_pose(frame)
-                active_model = pose_model_name
-        except Exception as e:
-            status.error(f"Inference error: {e}")
-            break
-
-        proc = time.time() - t0
-        st.session_state.last_proc = proc
-
-        app_fps = 1.0 / max(1e-6, proc)
-        stat_fps.metric("App FPS", f"{app_fps:.1f}")
-        stat_subjects.metric("People", str(n))
-        stat_mode.metric("Mode", mode)
-        stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
-        stat_model.metric("Model", active_model)
-
-        status.info(
-            f"Playing… frame {st.session_state.frame_pos} • skip {eff_stride} • proc {proc*1000:.0f} ms • target {1.0/max(1e-6,target_dt):.1f} fps"
+    if frame_count > 0:
+        seek_val = st.sidebar.slider(
+            "Position (frame)",
+            min_value=0,
+            max_value=max(0, frame_count - 1),
+            value=int(min(st.session_state.frame_pos, frame_count - 1)),
+            step=1,
+            key="seek_slider",
         )
+        if st.sidebar.button("⏩ Seek", width="stretch"):
+            st.session_state.seek_to = int(seek_val)
+    else:
+        st.sidebar.info("Seek disabled (unknown frame count).")
+else:
+    st.sidebar.info("Seek disabled for RTSP source.")
 
-        # Real-time pacing: sleep only if we are faster than real-time
-        time.sleep(max(0.0, target_dt - proc))
-except KeyboardInterrupt:
-    # Streamlit can interrupt this loop during shutdown; suppress traceback noise.
-    st.session_state.playing = False
-    st.session_state.paused = False
-finally:
-    cap.release()
+target_dt = (float(base_stride) / float(fps)) if fps > 0 else (1.0 / 30.0)
+source_uri = st.session_state.video_path if source_mode == SOURCE_DIRECT else st.session_state.rtsp_url
+
+
+def _update_rtsp_metrics(on_frame: bool):
+    if on_frame:
+        now = time.time()
+        prev_ts = st.session_state.rtsp_last_frame_ts
+        if prev_ts is not None:
+            inst_fps = 1.0 / max(1e-6, now - prev_ts)
+            old_fps = float(st.session_state.rtsp_fps or 0.0)
+            st.session_state.rtsp_fps = inst_fps if old_fps <= 0 else (0.8 * old_fps + 0.2 * inst_fps)
+        st.session_state.rtsp_last_frame_ts = now
+        st.session_state.rtsp_frame_id = int(st.session_state.rtsp_frame_id) + 1
+
+    if rtsp_fps_metric is not None:
+        if st.session_state.rtsp_fps > 0:
+            rtsp_fps_metric.metric("RTSP FPS", f"{st.session_state.rtsp_fps:.1f}")
+        else:
+            rtsp_fps_metric.metric("RTSP FPS", "-")
+    if rtsp_frame_metric is not None:
+        frame_id = int(st.session_state.rtsp_frame_id)
+        rtsp_frame_metric.metric("RTSP Frame", str(frame_id) if frame_id > 0 else "-")
+
+
+_update_rtsp_metrics(on_frame=False)
+
+
+def _render_rtsp_preview(preview_box):
+    preview_bgr = grab_rtsp_preview_frame(st.session_state, st.session_state.rtsp_url)
+    if preview_bgr is not None:
+        _update_rtsp_metrics(on_frame=True)
+        if preview_box is not None:
+            preview_box.image(preview_bgr, channels="BGR", width=320)
+    elif preview_box is not None:
+        preview_box.info("Waiting for RTSP preview...")
+
+run_playback(
+    state=st.session_state,
+    source_mode=source_mode,
+    source_uri=source_uri,
+    frame_count=frame_count,
+    target_dt=target_dt,
+    base_stride=int(base_stride),
+    max_skip=int(max_skip),
+    adaptive=adaptive,
+    mode=mode,
+    active_model_name=active_model_name,
+    draw_frame=draw_frame,
+    frame_box=frame_box,
+    status=status,
+    stat_fps=stat_fps,
+    stat_subjects=stat_subjects,
+    stat_mode=stat_mode,
+    stat_frame=stat_frame,
+    stat_model=stat_model,
+    rtsp_preview_box=None if use_browser_preview else rtsp_preview_box,
+    on_rtsp_frame=lambda: _update_rtsp_metrics(on_frame=True),
+)
+
+
+if source_mode == SOURCE_RTSP and st.session_state.rtsp_streaming and not st.session_state.playing and not use_browser_preview:
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=0.10)
+        def _rtsp_preview_fragment():
+            _render_rtsp_preview(rtsp_preview_box)
+
+        _rtsp_preview_fragment()
+    else:
+        # Fallback for older Streamlit: full rerun refresh.
+        _render_rtsp_preview(rtsp_preview_box)
+        time.sleep(0.2)
+        st.rerun()
