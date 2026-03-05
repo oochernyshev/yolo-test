@@ -45,11 +45,133 @@ def _write_detection_json(
     return None
 
 
+def _reset_minute_stats_bucket(state, minute_index: int):
+    state["minute_stats_current_index"] = int(minute_index)
+    state["minute_stats_objects_total"] = 0
+    state["minute_stats_processed_frames"] = 0
+    state["minute_stats_frames_with_detections"] = 0
+    state["minute_stats_unique_track_ids"] = []
+
+
+def _write_minute_stats_json(
+    state,
+    mode: str,
+    source_mode: str,
+    source_uri: str,
+    active_model_name: str,
+    source_fps: float,
+    minute_index: int,
+    is_partial: bool,
+):
+    session_dir = state.get("minute_stats_session_dir")
+    if not session_dir:
+        return "Minute stats export directory is not set."
+
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+        track_ids = sorted(
+            {
+                int(v)
+                for v in (state.get("minute_stats_unique_track_ids") or [])
+                if isinstance(v, int) or (isinstance(v, str) and v.lstrip("-").isdigit())
+            }
+        )
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "minute_index": int(minute_index),
+            "minute_start_sec": int(minute_index) * 60,
+            "minute_end_sec": (int(minute_index) + 1) * 60,
+            "is_partial": bool(is_partial),
+            "mode": mode,
+            "model": active_model_name,
+            "source_mode": source_mode,
+            "source_uri": source_uri,
+            "source_fps": float(source_fps),
+            "objects_detected_total": int(state.get("minute_stats_objects_total", 0)),
+            "processed_frames": int(state.get("minute_stats_processed_frames", 0)),
+            "frames_with_detections": int(state.get("minute_stats_frames_with_detections", 0)),
+            "unique_track_ids_count": len(track_ids),
+            "unique_track_ids": track_ids,
+        }
+        file_name = f"minute_{int(minute_index):04d}.json"
+        out_path = os.path.join(session_dir, file_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        state["minute_stats_written"] = int(state.get("minute_stats_written", 0)) + 1
+        state["minute_stats_last_error"] = None
+    except Exception as exc:
+        return str(exc)
+
+    return None
+
+
+def _update_minute_stats(
+    state,
+    mode: str,
+    source_mode: str,
+    source_uri: str,
+    active_model_name: str,
+    source_fps: float,
+    frame_pos: int,
+    detections,
+):
+    if not state.get("minute_stats_enabled"):
+        return None
+
+    fps_value = float(source_fps) if source_fps and float(source_fps) > 0 else 30.0
+    frames_per_minute = max(1, int(round(fps_value * 60.0)))
+    minute_index = int(max(0, int(frame_pos) - 1) // frames_per_minute)
+
+    current_index = state.get("minute_stats_current_index")
+    if current_index is None:
+        _reset_minute_stats_bucket(state, minute_index)
+    elif int(current_index) != minute_index:
+        flush_err = _write_minute_stats_json(
+            state=state,
+            mode=mode,
+            source_mode=source_mode,
+            source_uri=source_uri,
+            active_model_name=active_model_name,
+            source_fps=fps_value,
+            minute_index=int(current_index),
+            is_partial=False,
+        )
+        _reset_minute_stats_bucket(state, minute_index)
+        if flush_err is not None:
+            return flush_err
+
+    state["minute_stats_processed_frames"] = int(state.get("minute_stats_processed_frames", 0)) + 1
+
+    detected_count = len(detections)
+    state["minute_stats_objects_total"] = int(state.get("minute_stats_objects_total", 0)) + int(detected_count)
+    if detected_count > 0:
+        state["minute_stats_frames_with_detections"] = int(state.get("minute_stats_frames_with_detections", 0)) + 1
+
+    existing_ids = set()
+    for value in state.get("minute_stats_unique_track_ids") or []:
+        try:
+            existing_ids.add(int(value))
+        except Exception:
+            continue
+    for det in detections:
+        track_id = det.get("track_id") if isinstance(det, dict) else None
+        if track_id is None:
+            continue
+        try:
+            existing_ids.add(int(track_id))
+        except Exception:
+            continue
+    state["minute_stats_unique_track_ids"] = sorted(existing_ids)
+
+    return None
+
+
 def run_playback(
     state,
     source_mode: str,
     source_uri: str,
     frame_count: int,
+    source_fps: float,
     target_dt: float,
     base_stride: int,
     max_skip: int,
@@ -199,6 +321,20 @@ def run_playback(
                     state["export_json_last_error"] = export_err
                     status.warning(f"JSON export error: {export_err}")
 
+            minute_err = _update_minute_stats(
+                state=state,
+                mode=mode,
+                source_mode=source_mode,
+                source_uri=source_uri,
+                active_model_name=active_model_name,
+                source_fps=source_fps,
+                frame_pos=int(state.frame_pos),
+                detections=detections,
+            )
+            if minute_err and minute_err != state.get("minute_stats_last_error"):
+                state["minute_stats_last_error"] = minute_err
+                status.warning(f"Minute stats error: {minute_err}")
+
             proc = time.time() - t0
             state.last_proc = proc
 
@@ -219,5 +355,28 @@ def run_playback(
         state.playing = False
         state.paused = False
     finally:
+        if (
+            state.get("minute_stats_enabled")
+            and state.get("minute_stats_current_index") is not None
+            and int(state.get("minute_stats_processed_frames", 0)) > 0
+        ):
+            final_err = _write_minute_stats_json(
+                state=state,
+                mode=mode,
+                source_mode=source_mode,
+                source_uri=source_uri,
+                active_model_name=active_model_name,
+                source_fps=source_fps,
+                minute_index=int(state.get("minute_stats_current_index")),
+                is_partial=True,
+            )
+            if final_err and final_err != state.get("minute_stats_last_error"):
+                state["minute_stats_last_error"] = final_err
+            if final_err is None:
+                state["minute_stats_current_index"] = None
+                state["minute_stats_objects_total"] = 0
+                state["minute_stats_processed_frames"] = 0
+                state["minute_stats_frames_with_detections"] = 0
+                state["minute_stats_unique_track_ids"] = []
         if cap is not None:
             cap.release()

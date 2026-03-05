@@ -76,6 +76,15 @@ with st.sidebar:
         value=str(st.session_state.export_json_dir),
         disabled=not export_json_enabled,
     )
+    minute_stats_enabled = st.toggle(
+        "Save minute statistics JSON",
+        value=bool(st.session_state.minute_stats_enabled),
+    )
+    minute_stats_dir_val = st.text_input(
+        "Minute stats output folder",
+        value=str(st.session_state.minute_stats_dir),
+        disabled=not minute_stats_enabled,
+    )
 
     st.markdown("### Seek")
     st.caption("Tip: Pause -> Seek -> Start processing. Seek is only available in Direct file mode.")
@@ -83,6 +92,9 @@ with st.sidebar:
 st.session_state.export_json_enabled = bool(export_json_enabled)
 if str(export_json_dir_val).strip():
     st.session_state.export_json_dir = str(export_json_dir_val).strip()
+st.session_state.minute_stats_enabled = bool(minute_stats_enabled)
+if str(minute_stats_dir_val).strip():
+    st.session_state.minute_stats_dir = str(minute_stats_dir_val).strip()
 
 
 def _prepare_json_export_run(state, mode_value):
@@ -99,6 +111,32 @@ def _prepare_json_export_run(state, mode_value):
     state["export_json_session_dir"] = session_dir
     state["export_json_written"] = 0
     state["export_json_last_error"] = None
+
+
+def _prepare_minute_stats_run(state, mode_value):
+    if not state["minute_stats_enabled"]:
+        state["minute_stats_session_dir"] = None
+        state["minute_stats_written"] = 0
+        state["minute_stats_last_error"] = None
+        state["minute_stats_current_index"] = None
+        state["minute_stats_objects_total"] = 0
+        state["minute_stats_processed_frames"] = 0
+        state["minute_stats_frames_with_detections"] = 0
+        state["minute_stats_unique_track_ids"] = []
+        return
+
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_tag = "rtsp" if mode_value == SOURCE_RTSP else "direct"
+    session_dir = os.path.join(str(state["minute_stats_dir"]), f"{mode_tag}_{run_stamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    state["minute_stats_session_dir"] = session_dir
+    state["minute_stats_written"] = 0
+    state["minute_stats_last_error"] = None
+    state["minute_stats_current_index"] = None
+    state["minute_stats_objects_total"] = 0
+    state["minute_stats_processed_frames"] = 0
+    state["minute_stats_frames_with_detections"] = 0
+    state["minute_stats_unique_track_ids"] = []
 
 if st.session_state.source_mode_prev != source_mode:
     if st.session_state.source_mode_prev == SOURCE_RTSP:
@@ -224,6 +262,15 @@ if st.session_state.export_json_enabled:
     if st.session_state.export_json_last_error:
         st.warning(f"JSON export error: {st.session_state.export_json_last_error}")
 
+if st.session_state.minute_stats_enabled:
+    if st.session_state.minute_stats_session_dir:
+        st.caption(
+            f"Minute stats export: {st.session_state.minute_stats_written} files -> "
+            f"{st.session_state.minute_stats_session_dir}"
+        )
+    if st.session_state.minute_stats_last_error:
+        st.warning(f"Minute stats error: {st.session_state.minute_stats_last_error}")
+
 can_start_processing = st.session_state.video_path is not None
 
 c1, c2, c3 = st.columns(3)
@@ -231,6 +278,7 @@ with c1:
     if st.button("▶ Start processing", width="stretch", disabled=not can_start_processing):
         st.session_state.rtsp_last_error = None
         _prepare_json_export_run(st.session_state, source_mode)
+        _prepare_minute_stats_run(st.session_state, source_mode)
         if source_mode == SOURCE_RTSP and not st.session_state.rtsp_streaming:
             st.session_state.rtsp_should_be_running = True
             err = start_rtsp_stream(st.session_state, st.session_state.video_path, st.session_state.rtsp_url)
@@ -338,6 +386,7 @@ run_playback(
     source_mode=source_mode,
     source_uri=source_uri,
     frame_count=frame_count,
+    source_fps=float(fps),
     target_dt=target_dt,
     base_stride=int(base_stride),
     max_skip=int(max_skip),

@@ -38,6 +38,16 @@ def init_state(state):
         "export_json_session_dir": None,
         "export_json_written": 0,
         "export_json_last_error": None,
+        "minute_stats_enabled": True,
+        "minute_stats_dir": "minute_stats_json",
+        "minute_stats_session_dir": None,
+        "minute_stats_written": 0,
+        "minute_stats_last_error": None,
+        "minute_stats_current_index": None,
+        "minute_stats_objects_total": 0,
+        "minute_stats_processed_frames": 0,
+        "minute_stats_frames_with_detections": 0,
+        "minute_stats_unique_track_ids": [],
     }
     for key, value in defaults.items():
         if key not in state:
