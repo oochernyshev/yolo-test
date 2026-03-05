@@ -7,3 +7,5 @@
 *.engine
 *.tflite
 *.pb
+__pycache__/
+.venv/

@@ -197,95 +197,100 @@ def draw_pose(frame_bgr):
 
 # --- Playback loop ---
 # Updates ONLY the frame placeholder, avoiding full-page blinking.
-while True:
-    if not st.session_state.playing:
-        status.info("Stopped. Press Play.")
-        break
+try:
+    while True:
+        if not st.session_state.playing:
+            status.info("Stopped. Press Play.")
+            break
 
-    # Handle seek requests (works in stopped/paused/playing)
-    if st.session_state.seek_to is not None and frame_count > 0:
-        new_pos = int(max(0, min(st.session_state.seek_to, frame_count - 1)))
-        st.session_state.seek_to = None
-        st.session_state.frame_pos = new_pos
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(st.session_state.frame_pos))
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            try:
-                if mode == "People tracking (YOLO26)":
-                    _ = draw_people(frame)
-                    active_model = people_model_name
-                else:
-                    _ = draw_pose(frame)
-                    active_model = pose_model_name
-                stat_mode.metric("Mode", mode)
-                stat_model.metric("Model", active_model)
-                stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
-            except Exception as e:
-                status.error(f"Seek inference error: {e}")
+        # Handle seek requests (works in stopped/paused/playing)
+        if st.session_state.seek_to is not None and frame_count > 0:
+            new_pos = int(max(0, min(st.session_state.seek_to, frame_count - 1)))
+            st.session_state.seek_to = None
+            st.session_state.frame_pos = new_pos
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(st.session_state.frame_pos))
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                try:
+                    if mode == "People tracking (YOLO26)":
+                        _ = draw_people(frame)
+                        active_model = people_model_name
+                    else:
+                        _ = draw_pose(frame)
+                        active_model = pose_model_name
+                    stat_mode.metric("Mode", mode)
+                    stat_model.metric("Model", active_model)
+                    stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
+                except Exception as e:
+                    status.error(f"Seek inference error: {e}")
+                    break
+                status.info(f"Seeked to frame {st.session_state.frame_pos}.")
+            else:
+                status.error("Seek failed (could not read frame).")
                 break
-            status.info(f"Seeked to frame {st.session_state.frame_pos}.")
-        else:
-            status.error("Seek failed (could not read frame).")
+
+        if st.session_state.paused:
+            # Keep the last rendered frame visible while paused (even after reruns)
+            if st.session_state.last_frame_rgb is not None:
+                frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
+            status.warning("Paused. You can Seek, then press Pause again or Play to resume.")
+            time.sleep(0.1)
+            continue
+
+        # Decide how many frames to advance this tick
+        eff_stride = int(base_stride)
+        if adaptive:
+            last_proc = float(st.session_state.last_proc or 0.0)
+            ratio = last_proc / max(1e-6, target_dt) if last_proc > 0 else 1.0
+            eff_stride = max(int(base_stride), min(int(max_skip), int(round(ratio))))
+            eff_stride = max(1, eff_stride)
+
+        frame = None
+        for _ in range(int(eff_stride)):
+            ok, f = cap.read()
+            if not ok:
+                st.session_state.playing = False
+                frame = None
+                break
+            frame = f
+            st.session_state.frame_pos += 1
+
+        if frame is None:
+            status.success("Finished.")
             break
 
-    if st.session_state.paused:
-        # Keep the last rendered frame visible while paused (even after reruns)
-        if st.session_state.last_frame_rgb is not None:
-            frame_box.image(st.session_state.last_frame_rgb, channels="RGB", width="stretch")
-        status.warning("Paused. You can Seek, then press Pause again or Play to resume.")
-        time.sleep(0.1)
-        continue
+        t0 = time.time()
 
-    # Decide how many frames to advance this tick
-    eff_stride = int(base_stride)
-    if adaptive:
-        last_proc = float(st.session_state.last_proc or 0.0)
-        ratio = last_proc / max(1e-6, target_dt) if last_proc > 0 else 1.0
-        eff_stride = max(int(base_stride), min(int(max_skip), int(round(ratio))))
-        eff_stride = max(1, eff_stride)
-
-    frame = None
-    for _ in range(int(eff_stride)):
-        ok, f = cap.read()
-        if not ok:
-            st.session_state.playing = False
-            frame = None
+        try:
+            if mode == "People tracking (YOLO26)":
+                n = draw_people(frame)
+                active_model = people_model_name
+            else:
+                n = draw_pose(frame)
+                active_model = pose_model_name
+        except Exception as e:
+            status.error(f"Inference error: {e}")
             break
-        frame = f
-        st.session_state.frame_pos += 1
 
-    if frame is None:
-        status.success("Finished.")
-        break
+        proc = time.time() - t0
+        st.session_state.last_proc = proc
 
-    t0 = time.time()
+        app_fps = 1.0 / max(1e-6, proc)
+        stat_fps.metric("App FPS", f"{app_fps:.1f}")
+        stat_subjects.metric("People", str(n))
+        stat_mode.metric("Mode", mode)
+        stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
+        stat_model.metric("Model", active_model)
 
-    try:
-        if mode == "People tracking (YOLO26)":
-            n = draw_people(frame)
-            active_model = people_model_name
-        else:
-            n = draw_pose(frame)
-            active_model = pose_model_name
-    except Exception as e:
-        status.error(f"Inference error: {e}")
-        break
+        status.info(
+            f"Playing… frame {st.session_state.frame_pos} • skip {eff_stride} • proc {proc*1000:.0f} ms • target {1.0/max(1e-6,target_dt):.1f} fps"
+        )
 
-    proc = time.time() - t0
-    st.session_state.last_proc = proc
-
-    app_fps = 1.0 / max(1e-6, proc)
-    stat_fps.metric("App FPS", f"{app_fps:.1f}")
-    stat_subjects.metric("People", str(n))
-    stat_mode.metric("Mode", mode)
-    stat_frame.metric("Frame", f"{st.session_state.frame_pos}")
-    stat_model.metric("Model", active_model)
-
-    status.info(
-        f"Playing… frame {st.session_state.frame_pos} • skip {eff_stride} • proc {proc*1000:.0f} ms • target {1.0/max(1e-6,target_dt):.1f} fps"
-    )
-
-    # Real-time pacing: sleep only if we are faster than real-time
-    time.sleep(max(0.0, target_dt - proc))
-
-cap.release()
+        # Real-time pacing: sleep only if we are faster than real-time
+        time.sleep(max(0.0, target_dt - proc))
+except KeyboardInterrupt:
+    # Streamlit can interrupt this loop during shutdown; suppress traceback noise.
+    st.session_state.playing = False
+    st.session_state.paused = False
+finally:
+    cap.release()
